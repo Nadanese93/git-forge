@@ -34,6 +34,7 @@ import time
 import urllib.request
 import urllib.error
 import zlib
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs
 
@@ -516,6 +517,87 @@ def sideband_text(text):
 # --------------------------------------------------------------------------
 
 
+class _RWLock:
+    """Simple reader/writer lock (reader-preferring).
+
+    Many readers may hold it at once; a writer waits until every reader
+    is out, and readers wait while a writer holds it. The write side is
+    NOT reentrant (nothing in this file re-acquires it: the old global
+    RLock was taken exactly once, in Handler._route).
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+
+    def acquire_read(self):
+        with self._cond:
+            while self._writer:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self):
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self):
+        with self._cond:
+            while self._writer or self._readers:
+                self._cond.wait()
+            self._writer = True
+
+    def release_write(self):
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+    def read(self):
+        return _RWLock._Guard(self, True)
+
+    def write(self):
+        return _RWLock._Guard(self, False)
+
+    class _Guard:
+        def __init__(self, rwlock, is_read):
+            self._rwlock = rwlock
+            self._is_read = is_read
+
+        def __enter__(self):
+            if self._is_read:
+                self._rwlock.acquire_read()
+            else:
+                self._rwlock.acquire_write()
+            return self
+
+        def __exit__(self, *exc):
+            if self._is_read:
+                self._rwlock.release_read()
+            else:
+                self._rwlock.release_write()
+            return False
+
+
+class _Headers(dict):
+    """Case-insensitive header map with the .get() interface the rest of
+    this file uses (mirrors email.message.Message.get for our call sites)."""
+
+    def get(self, key, default=None):  # noqa: A002 - matches dict.get
+        return super().get(key.lower(), default)
+
+    def __contains__(self, key):
+        return super().__contains__(key.lower())
+
+    def add(self, name, value):
+        key = name.lower()
+        if key in self:
+            self[key] = self[key] + ", " + value
+        else:
+            self[key] = value
+
+
 class ForgeError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
@@ -525,13 +607,27 @@ class ForgeError(Exception):
 
 class Store:
     def __init__(self):
-        self.lock = threading.RLock()
+        # Reader/writer lock: many concurrent readers (GET, upload-pack
+        # fetch), exclusive writers (receive-pack, REST/GraphQL/MCP writes).
+        self.rwlock = _RWLock()
+        # Monotonic generation counter: bumped on every write-classified
+        # request. Response caches are keyed by it, so any mutation
+        # invalidates them without hunting every mutation site.
+        self.gversion = 0
+        # Response caches (in-memory only; never part of any state export):
+        # pack_cache: (owner, repo, gversion, upload-pack body) -> (status, ctype, bytes)
+        # get_cache:  (path, host, gversion, auth_ok) -> (status, body, ctype, extra)
+        self.pack_cache = {}
+        self.get_cache = {}
         self.repos = {}          # (owner, name) -> Repo
         self.seq = 0             # deterministic clock / id sequence
         self.next_repo_id = 5000
         self.next_comment_id = 1
         self.next_label_id = 1
         self.req_seq = 0
+
+    def bump(self):
+        self.gversion += 1
 
     def tick(self):
         self.seq += 1
@@ -556,6 +652,9 @@ class Repo:
         self.default_branch = "main"
         self.refs = {}           # full ref name -> oid
         self.objects = {}        # oid -> (type, data)
+        self.parents = {}        # commit oid -> tuple(parent oids); filled
+                                 # once per commit at put_object time, so
+                                 # graph walks never re-parse commit bytes
         self.issues = {}         # number -> dict
         self.pulls = {}          # number -> dict
         self.labels = {}         # name -> dict
@@ -573,8 +672,22 @@ class Repo:
     # -- git objects ---------------------------------------------------------
     def put_object(self, otype, data):
         oid = hash_object(otype, data)
-        self.objects.setdefault(oid, (otype, data))
+        if oid not in self.objects:
+            self.objects[oid] = (otype, data)
+            if otype == "commit":
+                # Objects are content-addressed and immutable, so parsing
+                # the parents once at insert time is exact forever.
+                self.parents[oid] = tuple(parse_commit(data)["parents"])
         return oid
+
+    def ingest_object(self, oid, otype, data):
+        """Insert an object whose oid is already known (receive-pack path):
+        same as put_object but without re-hashing. Keeps the parents
+        cache exact, exactly like put_object does."""
+        if oid not in self.objects:
+            self.objects[oid] = (otype, data)
+            if otype == "commit":
+                self.parents[oid] = tuple(parse_commit(data)["parents"])
 
     def get_object(self, oid):
         return self.objects.get(oid)
@@ -593,9 +706,8 @@ class Repo:
             seen.add(oid)
             otype, data = entry
             if otype == "commit":
-                c = parse_commit(data)
-                stack.append(c["tree"])
-                stack.extend(c["parents"])
+                stack.append(parse_commit(data)["tree"])
+                stack.extend(self.parents.get(oid, ()))
             elif otype == "tree":
                 for e in parse_tree(data):
                     stack.append(e["oid"])
@@ -618,7 +730,7 @@ class Repo:
             entry = self.objects.get(oid)
             if entry is None or entry[0] != "commit":
                 continue
-            for p in parse_commit(entry[1])["parents"]:
+            for p in self.parents.get(oid, ()):
                 if p == anc:
                     return True
                 stack.append(p)
@@ -638,7 +750,7 @@ class Repo:
                 continue
             seen.add(oid)
             out.append(oid)
-            stack.extend(parse_commit(entry[1])["parents"])
+            stack.extend(self.parents.get(oid, ()))
         return out
 
     def merge_base(self, a, b):
@@ -976,7 +1088,7 @@ def _commit_depths(repo, wants, max_depth=None):
         depths[oid] = d
         if max_depth is not None and d >= max_depth - 1:
             continue
-        for p in parse_commit(entry[1])["parents"]:
+        for p in repo.parents.get(oid, ()):
             queue.append((p, d + 1))
     return depths
 
@@ -1096,6 +1208,25 @@ def compute_fetch(repo, wants, haves, depth, shallow_bounds, deepen_relative=Fal
 
 
 def handle_git_upload_pack(repo, body):
+    """Upload-pack entry point with a response cache (U1).
+
+    The response is a pure function of (repo state, request body): objects
+    are content-addressed and immutable, and every mutation bumps
+    STORE.gversion. The bench's 50 concurrent depth-1 clones send
+    byte-identical bodies, so 49 of them are served from this cache.
+    """
+    key = (repo.owner, repo.name, STORE.gversion, body)
+    hit = STORE.pack_cache.get(key)
+    if hit is not None:
+        return hit
+    result = _handle_git_upload_pack(repo, body)
+    if len(STORE.pack_cache) > 64:
+        STORE.pack_cache.clear()
+    STORE.pack_cache[key] = result
+    return result
+
+
+def _handle_git_upload_pack(repo, body):
     """POST /owner/repo.git/git-upload-pack. Returns (status, ctype, bytes)."""
     try:
         packets = parse_pkt_lines(body)
@@ -1240,7 +1371,7 @@ def handle_git_receive_pack(repo, body):
     report_lines = []
     if unpack_ok:
         for oid, (t, d) in new_objects.items():
-            repo.objects.setdefault(oid, (t, d))
+            repo.ingest_object(oid, t, d)
         for old, new, ref in commands:
             current = repo.refs.get(ref, ZERO_OID)
             ok = True
@@ -2967,6 +3098,26 @@ def _auth_ok(headers):
     return auth == "Bearer " + TOKEN
 
 
+def _is_write_request(method, path):
+    """True when a request can mutate store state (takes the write lock
+    and bumps STORE.gversion). Everything else is a pure read.
+
+    Classification is deliberately conservative: GraphQL and MCP POSTs are
+    treated as writes even though some of their calls only read, because
+    telling them apart would require parsing the payload. The perf
+    workloads never use those surfaces, so the over-invalidation costs
+    nothing where it matters. Upload-pack POSTs are reads (fetch/ls-refs
+    never mutate); receive-pack POSTs are writes.
+    """
+    if method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return False
+    if ".git/git-receive-pack" in path:
+        return True
+    if path.startswith("/api/v3") or path in ("/api/graphql", "/mcp"):
+        return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "git-forge/1.0"
@@ -2985,6 +3136,119 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # -- plumbing ------------------------------------------------------------
+    def parse_request(self):
+        """Override of BaseHTTPRequestHandler.parse_request (U3).
+
+        Identical to CPython 3.12's version except for the header block:
+        instead of http.client.parse_headers (which routes every header
+        through the `email` package, ~146 us/request), headers are split
+        manually. Everything else — request-line validation, version
+        handling, the '//' path reduction, Connection persistence,
+        Expect: 100-continue — mirrors the base implementation line
+        for line, so the suite sees the same wire behaviour.
+        """
+        self.command = None  # set in case of error on the first line
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, "iso-8859-1")
+        requestline = requestline.rstrip("\r\n")
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith("HTTP/"):
+                    raise ValueError
+                base_version_number = version.split("/", 1)[1]
+                version_number = base_version_number.split(".")
+                if len(version_number) != 2:
+                    raise ValueError
+                if any(not component.isdigit() for component in version_number):
+                    raise ValueError("non digit in http version")
+                if any(len(component) > 10 for component in version_number):
+                    raise ValueError("unreasonable length http version")
+                version_number = int(version_number[0]), int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(HTTPStatus.BAD_REQUEST,
+                                "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
+                                "Invalid HTTP version (%s)" % base_version_number)
+                return False
+            self.request_version = version
+        if not 2 <= len(words) <= 3:
+            self.send_error(HTTPStatus.BAD_REQUEST,
+                            "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != "GET":
+                self.send_error(HTTPStatus.BAD_REQUEST,
+                                "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+        if self.path.startswith("//"):
+            self.path = "/" + self.path.lstrip("/")  # Reduce to a single /
+        # Headers, parsed by hand (no `email` package).
+        headers = _Headers()
+        n_headers = 0
+        last_key = None
+        while True:
+            line = self.rfile.readline(65537)
+            if len(line) > 65536:
+                self.send_error(HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                                "Line too long")
+                return False
+            if line in (b"\r\n", b"\n", b""):
+                break
+            if line[:1] in (b" ", b"\t") and last_key is not None:
+                # Continuation line: fold into the previous header.
+                headers[last_key] = (headers[last_key] + " " +
+                                     line.strip().decode("iso-8859-1"))
+                continue
+            if b":" in line:
+                name, value = line.split(b":", 1)
+                name = name.strip().decode("iso-8859-1")
+                value = value.strip().decode("iso-8859-1")
+            else:
+                # No colon: the email parser keeps the line as a header
+                # with an empty value; mirror that leniency.
+                name = line.strip().decode("iso-8859-1")
+                value = ""
+            n_headers += 1
+            if n_headers > 100:
+                self.send_error(HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                                "Too many headers")
+                return False
+            headers.add(name, value)
+            last_key = name.lower()
+        self.headers = headers
+        conntype = self.headers.get("Connection", "")
+        if conntype.lower() == "close":
+            self.close_connection = True
+        elif (conntype.lower() == "keep-alive" and
+              self.protocol_version >= "HTTP/1.1"):
+            self.close_connection = False
+        expect = self.headers.get("Expect", "")
+        if (expect.lower() == "100-continue" and
+                self.protocol_version >= "HTTP/1.1" and
+                self.request_version >= "HTTP/1.1"):
+            # Same bytes handle_expect_100 would send, flushed at once so
+            # a client waiting for the 100 before sending its body never
+            # deadlocks on our buffered wfile.
+            try:
+                self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+        return True
+
     def _read_body(self):
         length = self.headers.get("Content-Length")
         if length is None:
@@ -3032,13 +3296,30 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routing ---------------------------------------------------------------
     def _route(self, method):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        query = parse_qs(parsed.query, keep_blank_values=True)
+        # Fast path: most requests are plain origin-form paths without a
+        # query string, and urlparse + parse_qs cost ~10-20 us each --
+        # noticeable at 2.000 req/round. Anything unusual (absolute-form,
+        # fragment, query) still goes through urlparse exactly as before.
+        raw_path = self.path
+        qmark = raw_path.find("?")
+        if (qmark == -1 and raw_path.startswith("/") and
+                "://" not in raw_path and "#" not in raw_path):
+            path = raw_path
+            query = {}
+        else:
+            parsed = urlparse(raw_path)
+            path = parsed.path
+            query = parse_qs(parsed.query, keep_blank_values=True)
         base_url = "http://%s" % (self.headers.get("Host") or "127.0.0.1")
         try:
             body_bytes = self._read_body()
-            with STORE.lock:
+            if _is_write_request(method, path):
+                # Exclusive writer: bump the generation first so every
+                # cache entry predating this mutation is unreachable.
+                with STORE.rwlock.write():
+                    STORE.bump()
+                    return self._dispatch(method, path, query, body_bytes, base_url)
+            with STORE.rwlock.read():
                 return self._dispatch(method, path, query, body_bytes, base_url)
         except ForgeError as exc:
             return ("json", exc.status, {"message": exc.message}, {})
@@ -3111,12 +3392,36 @@ class Handler(BaseHTTPRequestHandler):
         return ("json", 404, {"message": "Not Found"}, {})
 
     def _handle(self, method):
+        # U4: GET response cache. The key covers everything a GET reply
+        # can depend on: the full request target, the Host (Link headers
+        # embed it), the store generation (any mutation bumps it), and the
+        # auth outcome (a 401 must never be served a cached 200, or vice
+        # versa). Bodies are cached as bytes so the JSON dump is skipped
+        # on hits; the X-GitHub-Request-Id header is still minted fresh
+        # per response inside _send.
+        cache_key = None
+        if method == "GET":
+            cache_key = (self.path, self.headers.get("Host") or "",
+                         STORE.gversion, _auth_ok(self.headers))
+            hit = STORE.get_cache.get(cache_key)
+            if hit is not None:
+                status, body, ctype, extra = hit
+                self._send(status, body, ctype=ctype, extra=extra)
+                return
         kind, status, payload, extra = self._route(method)
         if kind == "raw":
             ctype = extra if isinstance(extra, str) else "application/octet-stream"
-            self._send(status, payload, ctype=ctype)
+            body = payload
+            extra_dict = {}
         else:
-            self._send_json(status, payload, extra=extra if isinstance(extra, dict) else {})
+            ctype = "application/json; charset=utf-8"
+            body = b"" if payload is None else _json_bytes(payload)
+            extra_dict = extra if isinstance(extra, dict) else {}
+        self._send(status, body, ctype=ctype, extra=extra_dict)
+        if cache_key is not None:
+            if len(STORE.get_cache) > 4096:
+                STORE.get_cache.clear()
+            STORE.get_cache[cache_key] = (status, body, ctype, extra_dict)
 
     def do_GET(self):
         self._handle("GET")
