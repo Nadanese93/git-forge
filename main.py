@@ -614,10 +614,8 @@ class Store:
         # request. Response caches are keyed by it, so any mutation
         # invalidates them without hunting every mutation site.
         self.gversion = 0
-        # Response caches (in-memory only; never part of any state export):
-        # pack_cache: (owner, repo, gversion, upload-pack body) -> (status, ctype, bytes)
+        # Response cache (in-memory only; never part of any state export):
         # get_cache:  (path, host, gversion, auth_ok) -> (status, body, ctype, extra)
-        self.pack_cache = {}
         self.get_cache = {}
         self.repos = {}          # (owner, name) -> Repo
         self.seq = 0             # deterministic clock / id sequence
@@ -1208,25 +1206,6 @@ def compute_fetch(repo, wants, haves, depth, shallow_bounds, deepen_relative=Fal
 
 
 def handle_git_upload_pack(repo, body):
-    """Upload-pack entry point with a response cache (U1).
-
-    The response is a pure function of (repo state, request body): objects
-    are content-addressed and immutable, and every mutation bumps
-    STORE.gversion. The bench's 50 concurrent depth-1 clones send
-    byte-identical bodies, so 49 of them are served from this cache.
-    """
-    key = (repo.owner, repo.name, STORE.gversion, body)
-    hit = STORE.pack_cache.get(key)
-    if hit is not None:
-        return hit
-    result = _handle_git_upload_pack(repo, body)
-    if len(STORE.pack_cache) > 64:
-        STORE.pack_cache.clear()
-    STORE.pack_cache[key] = result
-    return result
-
-
-def _handle_git_upload_pack(repo, body):
     """POST /owner/repo.git/git-upload-pack. Returns (status, ctype, bytes)."""
     try:
         packets = parse_pkt_lines(body)
